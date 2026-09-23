@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+embeddings_cache.json
+_uploaded.csv
+__pycache__/
+*.pyc
