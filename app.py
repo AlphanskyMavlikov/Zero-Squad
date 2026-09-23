@@ -4,7 +4,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
+from openai import OpenAI, AuthenticationError, RateLimitError, APIConnectionError, APIStatusError
 
 HERE=Path(__file__).parent
 EMBED_MODEL="text-embedding-3-small"
@@ -14,8 +14,31 @@ PATHS=[Path(r"C:\Users\admin\Downloads\hackathon dataset anonymized .csv"),Path(
 
 def norm(x): return re.sub(r"\s+"," ",str(x).strip().lower())
 def parts(x): return [] if pd.isna(x) else [norm(v) for v in str(x).split("|") if v.strip()]
-def key(): return os.getenv("OPENAI_API_KEY")
+def key():
+    # Автоматически используем локальный .streamlit/secrets.toml.
+    # Если файла нет — пробуем переменную среды. Ошибка отсутствия secrets не ломает приложение.
+    try:
+        value = st.secrets["OPENAI_API_KEY"]
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    value = os.getenv("OPENAI_API_KEY")
+    return value.strip() if value else None
 def cli(): return OpenAI(api_key=key()) if key() else None
+
+def check_openai_connection():
+    if not key(): return "missing","API-ключ не найден."
+    try:
+        cli().embeddings.create(model=EMBED_MODEL,input="connection test")
+        return "ok",f"OpenAI API работает. Embedding model: {EMBED_MODEL}"
+    except AuthenticationError: return "auth","API-ключ недействителен (401). Создайте новый ключ."
+    except RateLimitError as e:
+        m=str(e).lower()
+        return ("quota","Ключ принят, но квота/баланс исчерпаны или биллинг не настроен.") if any(x in m for x in ["quota","billing","credit"]) else ("rate","Достигнут временный лимит запросов.")
+    except APIConnectionError: return "network","Нет соединения с OpenAI API."
+    except APIStatusError as e: return "api",f"OpenAI API вернул HTTP {e.status_code}."
+    except Exception as e: return "other",f"{type(e).__name__}: {e}"
 
 @st.cache_data
 def load(path):
@@ -54,18 +77,60 @@ def qtext(fmt,cat,lang,hours):
 def ptext(r):
     return f"Категория: {r.categories}. Форматы: {r.event_formats}. Языки: {r.languages}. Описание: {r.description}"
 
-def failures(r,dt,fmt,budget,lang,hours):
+def mode_config(mode):
+    # Дата, город и категория никогда не ослабляются.
+    # Бюджет: Hard = строго; Medium = до +15%; Light = до +30%.
+    # Medium/Light также мягче относятся к языку и длительности, но формат остаётся обязательным.
+    return {
+        "Hard":   {"budget_over":0.00, "duration_shortfall":0.00, "language_hard":True},
+        "Medium": {"budget_over":0.15, "duration_shortfall":0.15, "language_hard":False},
+        "Light":  {"budget_over":0.30, "duration_shortfall":0.30, "language_hard":False},
+    }[mode]
+
+def failures(r,dt,fmt,budget,lang,hours,mode):
+    cfg=mode_config(mode)
     f=[]
-    if dt.isoformat() in parts(r.busy_dates):f.append(("date",f"занят {dt:%d.%m.%Y}"))
-    if pd.isna(r.price_from_kzt):f.append(("budget","цена не указана"))
-    elif r.price_from_kzt>budget:f.append(("budget",f"цена превышает бюджет на {int(r.price_from_kzt-budget):,} ₸".replace(","," ")))
-    if norm(fmt) not in parts(r.event_formats):f.append(("format",f"не берёт формат «{fmt}»"))
-    if lang and norm(lang) not in parts(r.languages):f.append(("language",f"не работает на языке «{lang}»"))
-    if hours and not pd.isna(r.max_hours) and r.max_hours<hours:f.append(("duration",f"максимум {r.max_hours:g} ч, требуется {hours:g} ч"))
+    if dt.isoformat() in parts(r.busy_dates):
+        f.append(("date",f"занят {dt:%d.%m.%Y}"))
+    if pd.isna(r.price_from_kzt):
+        f.append(("budget","цена не указана"))
+    elif r.price_from_kzt > budget*(1+cfg["budget_over"]):
+        limit=int(budget*(1+cfg["budget_over"]))
+        f.append(("budget",f"цена {int(r.price_from_kzt):,} ₸ выше допустимого лимита {limit:,} ₸ для режима {mode}".replace(","," ")))
+    if norm(fmt) not in parts(r.event_formats):
+        f.append(("format",f"не берёт формат «{fmt}»"))
+    if lang and cfg["language_hard"] and norm(lang) not in parts(r.languages):
+        f.append(("language",f"не работает на языке «{lang}»"))
+    if hours and not pd.isna(r.max_hours):
+        min_hours=hours*(1-cfg["duration_shortfall"])
+        if r.max_hours < min_hours:
+            f.append(("duration",f"максимум {r.max_hours:g} ч — слишком мало для запроса {hours:g} ч в режиме {mode}"))
     return f
 
-def breakdown(r,budget,lang,hours,sim):
-    budget_pts=round(20*max(0,1-r.price_from_kzt/max(budget,1)),1)
+def relaxed_notes(r,budget,lang,hours,mode):
+    """Что именно было ослаблено для прошедшего кандидата."""
+    notes=[]
+    if r.price_from_kzt>budget:
+        diff=int(r.price_from_kzt-budget)
+        pct=(r.price_from_kzt/budget-1)*100
+        notes.append(f"цена выше бюджета на {diff:,} ₸ ({pct:.1f}%), но это допустимо в режиме {mode}".replace(","," "))
+    elif r.price_from_kzt<=budget:
+        reserve=int(budget-r.price_from_kzt)
+        notes.append(f"цена ниже бюджета на {reserve:,} ₸".replace(","," "))
+    if lang and norm(lang) not in parts(r.languages) and mode!="Hard":
+        notes.append(f"язык «{lang}» не совпадает; в режиме {mode} язык считается мягким критерием")
+    if hours and not pd.isna(r.max_hours) and r.max_hours<hours and mode!="Hard":
+        notes.append(f"длительность меньше запроса на {hours-r.max_hours:g} ч, но находится в допустимом отклонении режима {mode}")
+    return notes
+
+def breakdown(r,budget,lang,hours,sim,mode):
+    cfg=mode_config(mode)
+    ratio=float(r.price_from_kzt)/max(float(budget),1)
+    if ratio<=1:
+        budget_pts=round(20*(1-ratio),1)
+    else:
+        # Прошедший по tolerance кандидат получает штраф, а не преимущество.
+        budget_pts=round(-20*((ratio-1)/max(cfg["budget_over"],0.01)),1)
     format_pts=25.
     lang_pts=15. if lang else 10.
     duration_pts=10.
@@ -75,25 +140,26 @@ def breakdown(r,budget,lang,hours,sim):
     x["Итого"]=round(sum(x.values()),1)
     return x
 
-def explain(r,dt,fmt,cat,budget,lang,hours,sim,br):
+def explain(r,dt,fmt,cat,budget,lang,hours,sim,br,mode):
     c=cli()
     if not c:return "Добавьте OPENAI_API_KEY — тогда ИИ-агент сгенерирует персональное объяснение. Hard filters продолжают работать."
     ev={"name":r.anon_name,"category":cat,"city":r.city,"date":dt.isoformat(),"event_type":fmt,
         "budget_kzt":int(budget),"price_from_kzt":int(r.price_from_kzt),"requested_language":lang,
         "languages":parts(r.languages),"requested_hours":hours,"max_hours":None if pd.isna(r.max_hours) else float(r.max_hours),
-        "description":str(r.description),"semantic_similarity":round(sim,4),"score":br,"availability":"free"}
+        "description":str(r.description),"semantic_similarity":round(sim,4),"score":br,"availability":"free",
+        "selection_mode":mode,"relaxed_conditions":relaxed_notes(r,budget,lang,hours,mode)}
     sys="""Ты агент объяснения рекомендаций event-подрядчиков. На русском напиши 1–2 конкретных предложения,
 почему подрядчик попал в TOP. Используй ТОЛЬКО JSON-факты, ничего не придумывай.
 Упомяни наиболее различающие факты: цену относительно бюджета, формат, язык/длительность если запрошены
 и конкретный смысл description. Не называй similarity числом. Не используй общие фразы вроде «отличный выбор»."""
     return c.responses.create(model=EXPLAIN_MODEL,input=[{"role":"system","content":sys},{"role":"user","content":json.dumps(ev,ensure_ascii=False)}]).output_text.strip()
 
-def recommend(df,city,dt,fmt,cat,budget,hours,lang):
+def recommend(df,city,dt,fmt,cat,budget,hours,lang,mode):
     pool=df[df.city.map(norm).eq(norm(city)) & df.categories.apply(lambda x:norm(cat) in parts(x))]
     if pool.empty:return {"status":"none","pool":pool,"passed":[],"rejected":[],"counts":{}}
     passed=[];rej=[];counts={k:0 for k in ["date","budget","format","language","duration"]}
     for _,r in pool.iterrows():
-        f=failures(r,dt,fmt,budget,lang,hours)
+        f=failures(r,dt,fmt,budget,lang,hours,mode)
         if f:
             rej.append((r,f))
             for code,_ in f:counts[code]+=1
@@ -103,7 +169,7 @@ def recommend(df,city,dt,fmt,cat,budget,hours,lang):
     ranked=[]
     for r in passed:
         sim=cos(q,embed(ptext(r)))
-        br=breakdown(r,budget,lang,hours,sim)
+        br=breakdown(r,budget,lang,hours,sim,mode)
         ranked.append((br["Итого"],sim,str(r.id),r,br))
     ranked.sort(key=lambda x:(-x[0],-x[1],x[2]))
     return {"status":"ok","pool":pool,"passed":ranked,"rejected":rej,"counts":counts}
@@ -114,12 +180,20 @@ st.caption("Hard filters → semantic embeddings → прозрачный score 
 
 path=next((p for p in PATHS if p.exists()),None)
 with st.sidebar:
-    up=st.file_uploader("Другой CSV",type="csv")
+    st.header("Настройки")
+    up=st.file_uploader("Другой CSV",type=["csv"])
     if up:
-        path=HERE/"_uploaded.csv";path.write_bytes(up.getvalue())
-    st.write("OpenAI API:","✅ подключён" if key() else "⚠️ OPENAI_API_KEY не задан")
-    if not key():
-        st.caption("Задайте ключ перед запуском: $env:OPENAI_API_KEY=\"sk-proj-...\"")
+        path=HERE/"_uploaded.csv"; path.write_bytes(up.getvalue())
+    st.subheader("OpenAI API")
+    st.write("🔑 Локальный ключ найден" if key() else "⚠️ API-ключ не настроен")
+    if st.button("Проверить подключение OpenAI",use_container_width=True):
+        with st.spinner("Проверяю реальным API-запросом..."):
+            status,msg=check_openai_connection()
+        if status=="ok": st.success("✅ "+msg)
+        elif status=="auth": st.error("❌ "+msg)
+        else: st.warning("⚠️ "+msg)
+    st.caption("Ключ хранится локально в .streamlit/secrets.toml.")
+
 if not path:st.stop()
 df=load(str(path))
 cities=sorted(df.city.dropna().unique())
@@ -131,21 +205,51 @@ with st.form("form"):
     a,b,c=st.columns(3);city=a.selectbox("Город",cities);dt=b.date_input("Дата",date(2026,10,17),min_value=date(2026,9,23),max_value=date(2026,12,31));fmt=c.selectbox("Тип мероприятия",fmts)
     a,b,c=st.columns(3);cat=a.selectbox("Категория",cats);budget=b.number_input("Бюджет, ₸",1,20_000_000,800_000,50_000);lu=c.selectbox("Язык",["Неважно"]+langs)
     useh=st.checkbox("Указать длительность");hours=st.number_input("Часы",1.,24.,6.,.5,disabled=not useh)
+    mode=st.radio(
+        "Режим отбора",
+        ["Hard","Medium","Light"],
+        horizontal=True,
+        help="Hard — строгие условия. Medium — допускает умеренные отклонения. Light — допускает более заметные отклонения, но дата, город, категория и формат остаются обязательными."
+    )
+    if mode=="Hard":
+        st.caption("🔒 Hard: бюджет не превышается; язык и длительность — строгие условия.")
+    elif mode=="Medium":
+        st.caption("⚖️ Medium: допускается цена до +15% к бюджету и до 15% нехватки по длительности; язык становится мягким критерием.")
+    else:
+        st.caption("🪶 Light: допускается цена до +30% к бюджету и до 30% нехватки по длительности; язык становится мягким критерием.")
     go=st.form_submit_button("Подобрать",type="primary",use_container_width=True)
 
 if go:
     lang=None if lu=="Неважно" else lu;h=float(hours) if useh else None
-    with st.spinner("Hard filters + semantic matching..."):res=recommend(df,city,dt,fmt,cat,float(budget),h,lang)
+    try:
+        with st.spinner("Hard filters + semantic matching..."):
+            res=recommend(df,city,dt,fmt,cat,float(budget),h,lang,mode)
+    except AuthenticationError:
+        st.error("❌ OpenAI отклонил API-ключ (401). Создайте новый ключ и выполните настройку заново.")
+        st.stop()
+    except RateLimitError as e:
+        msg=str(e).lower()
+        if any(x in msg for x in ["quota","billing","credit"]):
+            st.error("⚠️ API-ключ распознан, но квота/баланс исчерпаны или биллинг не настроен.")
+        else:
+            st.error("⏳ Достигнут временный лимит запросов OpenAI. Попробуйте позже.")
+        st.stop()
+    except APIConnectionError:
+        st.error("❌ Нет соединения с OpenAI API. Проверьте интернет.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Ошибка API: {type(e).__name__}: {e}")
+        st.stop()
     st.subheader("Воронка отбора")
     n=len(res["pool"]);pn=len(res["passed"])
-    st.write(f"**Город + категория:** {n} → **после hard filters:** {pn} → **TOP:** {min(3,pn)}")
+    st.write(f"**Город + категория:** {n} → **после {mode}-отбора:** {pn} → **TOP:** {min(3,pn)}")
     names={"date":"🔴 Заняты на дату","budget":"🟠 Не проходят бюджет","format":"🟡 Не берут формат","language":"🔵 Не подходят по языку","duration":"🟣 Не хватает длительности"}
     rows=[{"Причина":names[k],"Количество":v} for k,v in res["counts"].items() if v]
     if rows:st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
     st.caption("Один профиль может иметь несколько причин отсева.")
 
     if res["status"]=="none":st.warning(f"В городе {city} категории «{cat}» нет.")
-    elif res["status"]=="filtered":st.error("Кандидаты есть, но никто не проходит все hard-условия.")
+    elif res["status"]=="filtered":st.error(f"Кандидаты есть, но никто не проходит условия режима {mode}.")
     else:
         if len(res["passed"])<3:st.warning(f"Подходящих только {len(res['passed'])}; поэтому карточек меньше трёх.")
         cols=st.columns(min(3,len(res["passed"])))
@@ -153,19 +257,18 @@ if go:
             with col:
                 st.subheader(str(r.anon_name));st.caption("🧪 СИНТЕТИЧЕСКИЙ" if r.synthetic else "👤 ИСХОДНЫЙ")
                 st.metric("Совместимость",f"{total:.1f} / 100")
+                st.caption(f"Режим отбора: **{mode}**")
+                notes=relaxed_notes(r,float(budget),lang,h,mode)
+                if notes:
+                    st.write("**Почему прошёл условия:**")
+                    for note in notes: st.write("• "+note)
                 st.write(f"**Цена от:** {int(r.price_from_kzt):,} ₸".replace(","," "))
                 st.dataframe(pd.DataFrame([{"Фактор":k,"Баллы":v} for k,v in br.items() if k!="Итого"]),hide_index=True,use_container_width=True)
-                with st.spinner("ИИ-агент пишет объяснение..."):st.info(explain(r,dt,fmt,cat,float(budget),lang,h,sim,br))
+                with st.spinner("ИИ-агент пишет объяснение..."):st.info(explain(r,dt,fmt,cat,float(budget),lang,h,sim,br,mode))
                 with st.expander("Технически"):st.write(f"Cosine similarity: {sim:.4f}");st.write(f"Embedding: `{EMBED_MODEL}` · LLM: `{EXPLAIN_MODEL}`")
 
     st.subheader("Почему не этот подрядчик?")
-    if not res["rejected"]:st.write("На hard filters никто не был исключён.")
+    if not res["rejected"]:st.write(f"На этапе {mode}-отбора никто не был исключён.")
     for r,fs in res["rejected"]:
         with st.expander(f"{r.anon_name} — исключён"):
             for _,reason in fs:st.write("❌ "+reason)
-            st.caption("Embeddings не могут вернуть профиль: semantic ranking выполняется только после hard filters.")
-
-with st.expander("Архитектура"):
-    st.code("""CSV → City+Category → HARD FILTERS(date/budget/format/language/duration)
-→ valid candidates only → embeddings semantic similarity → deterministic score → TOP 3
-→ grounded AI explanation from structured evidence""")
