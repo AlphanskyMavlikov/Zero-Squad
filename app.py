@@ -245,8 +245,8 @@ def pair_reason(a,b,budget):
     if best: diffs.append("; ".join(best[:2]))
     return ". ".join(diffs)+"."
 
-st.set_page_config(page_title="Contractor Matcher V6",page_icon="🧠",layout="wide")
-st.title("🧠 Умный подбор подрядчиков — V6")
+st.set_page_config(page_title="Умный подбор подрядчиков",page_icon="🧠",layout="wide")
+st.title("🧠 Умный подбор подрядчиков")
 st.caption("Результаты обновляются автоматически при изменении параметров заказа.")
 
 path=next((p for p in PATHS if p.exists()),None)
